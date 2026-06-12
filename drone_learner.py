@@ -1,17 +1,20 @@
 """
 DroneReactionLearner — learns how drone2 should react to drone1.
 
-Learning paradigm: Cross-Entropy Method (CEM)
-  Why not RL?  RL (PPO, DDPG) works here too, but adds a value function,
-  per-step reward signals, and careful hyperparameter tuning.  CEM is
-  simpler: sample a population of policy parameter vectors, score each
-  with the fitness function over a full episode, keep the top fraction,
-  and shift the search distribution toward them.  For this problem size
-  it converges in minutes with no gradient computation.
+The learning algorithm is modular: pass any PolicyOptimizer to train().
+Two implementations are provided:
+  - CEMOptimizer    (Cross-Entropy Method, default)
+  - GAOptimizer     (Genetic Algorithm)
+
+Both treat the task as a black-box optimisation problem: sample a
+population of policy parameter vectors, score each by running a full
+simulation episode, and shift the population toward higher-scoring
+individuals.  No gradients are needed.
 
 Usage:
-  python drone_learner.py train   # run CEM, save policy
-  python drone_learner.py eval    # load policy, visualise in GUI
+  python drone_learner.py train cem   # train with CEM (default)
+  python drone_learner.py train ga    # train with genetic algorithm
+  python drone_learner.py eval        # load policy and visualise
 
 Integration with pybulletsim.py:
   from drone_learner import DroneReactionLearner
@@ -22,6 +25,8 @@ Integration with pybulletsim.py:
 
 import sys
 import time
+from abc import ABC, abstractmethod
+
 import numpy as np
 import pybullet as p
 import pybullet_data
@@ -36,10 +41,165 @@ SIM_HZ = 240
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+# ══ optimizers ════════════════════════════════════════════════════════════════
+
+class PolicyOptimizer(ABC):
+    """
+    Base class for population-based policy optimizers.
+
+    Subclasses implement optimize(), which takes a fitness function and an
+    initial parameter vector and returns the best parameter vector found.
+    """
+
+    @abstractmethod
+    def optimize(self, fitness_fn, initial_params: np.ndarray) -> np.ndarray:
+        """
+        fitness_fn : callable(np.ndarray) -> float   higher = better
+        initial_params : starting point for the search
+        returns : best parameter vector found
+        """
+
+
+class CEMOptimizer(PolicyOptimizer):
+    """
+    Cross-Entropy Method.
+    Maintains a Gaussian distribution over parameters.  Each generation:
+      1. Sample pop_size candidates from N(mu, sigma^2 I)
+      2. Score with fitness_fn
+      3. Update mu to the mean of the top elite_frac candidates
+      4. Decay sigma toward a floor
+    """
+
+    def __init__(self,
+                 n_generations: int = 60,
+                 pop_size: int = 24,
+                 elite_frac: float = 0.25,
+                 sigma: float = 0.5,
+                 sigma_decay: float = 0.97,
+                 sigma_floor: float = 0.02):
+        self.n_generations = n_generations
+        self.pop_size = pop_size
+        self.elite_frac = elite_frac
+        self.sigma = sigma
+        self.sigma_decay = sigma_decay
+        self.sigma_floor = sigma_floor
+
+    def optimize(self, fitness_fn, initial_params: np.ndarray) -> np.ndarray:
+        mu = initial_params.copy()
+        n = len(mu)
+        n_elite = max(2, int(self.pop_size * self.elite_frac))
+        sigma = self.sigma
+
+        print(f"CEM  generations={self.n_generations}  "
+              f"pop={self.pop_size}  elite={n_elite}  sigma0={sigma}")
+
+        for gen in range(self.n_generations):
+            candidates = mu + np.random.randn(self.pop_size, n) * sigma
+            scores = np.array([fitness_fn(c) for c in candidates])
+
+            elite_idx = np.argsort(scores)[-n_elite:]
+            mu = candidates[elite_idx].mean(axis=0)
+            sigma = max(self.sigma_floor, sigma * self.sigma_decay)
+
+            print(f"  gen {gen + 1:3d}  "
+                  f"mean_dist={-scores.mean():.3f}  "
+                  f"best_dist={-scores[elite_idx[-1]]:.3f}  "
+                  f"sigma={sigma:.4f}")
+
+        return mu
+
+
+class GAOptimizer(PolicyOptimizer):
+    """
+    Genetic Algorithm.
+    Each generation:
+      1. Score all individuals with fitness_fn
+      2. Carry the top elite_frac directly to the next generation (elitism)
+      3. Fill the rest via tournament selection + uniform crossover + mutation
+    """
+
+    def __init__(self,
+                 n_generations: int = 60,
+                 pop_size: int = 30,
+                 elite_frac: float = 0.1,
+                 mutation_sigma: float = 0.2,
+                 mutation_decay: float = 0.98,
+                 mutation_floor: float = 0.01,
+                 crossover_rate: float = 0.7,
+                 tournament_k: int = 3):
+        self.n_generations = n_generations
+        self.pop_size = pop_size
+        self.elite_frac = elite_frac
+        self.mutation_sigma = mutation_sigma
+        self.mutation_decay = mutation_decay
+        self.mutation_floor = mutation_floor
+        self.crossover_rate = crossover_rate
+        self.tournament_k = tournament_k
+
+    def _tournament(self, pop: np.ndarray, scores: np.ndarray) -> np.ndarray:
+        idx = np.random.choice(len(pop), self.tournament_k, replace=False)
+        return pop[idx[np.argmax(scores[idx])]].copy()
+
+    def optimize(self, fitness_fn, initial_params: np.ndarray) -> np.ndarray:
+        n = len(initial_params)
+        n_elite = max(1, int(self.pop_size * self.elite_frac))
+        mutation_sigma = self.mutation_sigma
+
+        # Seed population around the initial params
+        pop = initial_params + np.random.randn(self.pop_size, n) * 0.5
+
+        best_params = initial_params.copy()
+        best_score = -np.inf
+
+        print(f"GA   generations={self.n_generations}  "
+              f"pop={self.pop_size}  elite={n_elite}  "
+              f"mutation_sigma0={mutation_sigma}")
+
+        for gen in range(self.n_generations):
+            scores = np.array([fitness_fn(ind) for ind in pop])
+
+            # Track global best
+            gen_best_idx = np.argmax(scores)
+            if scores[gen_best_idx] > best_score:
+                best_score = scores[gen_best_idx]
+                best_params = pop[gen_best_idx].copy()
+
+            # Elitism: carry top individuals unchanged
+            elite_idx = np.argsort(scores)[-n_elite:]
+            new_pop = [pop[i].copy() for i in elite_idx]
+
+            # Fill rest with crossover + mutation
+            while len(new_pop) < self.pop_size:
+                parent_a = self._tournament(pop, scores)
+                parent_b = self._tournament(pop, scores)
+
+                if np.random.random() < self.crossover_rate:
+                    mask = np.random.rand(n) < 0.5
+                    child = np.where(mask, parent_a, parent_b)
+                else:
+                    child = parent_a.copy()
+
+                child += np.random.randn(n) * mutation_sigma
+                new_pop.append(child)
+
+            pop = np.array(new_pop)
+            mutation_sigma = max(self.mutation_floor,
+                                 mutation_sigma * self.mutation_decay)
+
+            print(f"  gen {gen + 1:3d}  "
+                  f"mean_dist={-scores.mean():.3f}  "
+                  f"best_dist={-best_score:.3f}  "
+                  f"mutation={mutation_sigma:.4f}")
+
+        return best_params
+
+
+# ══ learner ═══════════════════════════════════════════════════════════════════
+
 class DroneReactionLearner:
-    STATE_DIM = 6   # [leader_pos - follower_pos,  follower_vel]
+    STATE_DIM = 9   # [leader_pos - follower_pos,  follower_vel,  leader_vel]
     ACTION_DIM = 3  # force vector applied to drone2
-    MAX_FORCE = 15.0
+    MAX_FORCE = 12.0  # matches leader peak (LEADER_FORCE_SCALE * 1.5)
 
     def __init__(self, hidden_size: int = 16):
         h = hidden_size
@@ -72,11 +232,12 @@ class DroneReactionLearner:
         return np.tanh(h @ W2 + b2) * self.MAX_FORCE
 
     def get_action(self,
-                   follower_pos, follower_vel, leader_pos) -> np.ndarray:
+                   follower_pos, follower_vel, leader_pos, leader_vel) -> np.ndarray:
         """Execution mode: return force vector for drone2."""
         state = np.concatenate([
             np.asarray(leader_pos) - np.asarray(follower_pos),
             np.asarray(follower_vel),
+            np.asarray(leader_vel),
         ])
         return self._forward(self.params, state)
 
@@ -94,10 +255,10 @@ class DroneReactionLearner:
 
     def _run_episode(self,
                      flat: np.ndarray,
-                     n_steps: int = 400,
+                     n_steps: int = 800,
                      render: bool = False,
-                     playback_speed: float = 1.0) -> float:
-        """Run one physics episode; return fitness score."""
+                     playback_speed: float = 1.5) -> float:
+        """Run one physics episode and return the fitness score."""
         client = p.connect(p.GUI if render else p.DIRECT)
         p.setAdditionalSearchPath(pybullet_data.getDataPath(),
                                   physicsClientId=client)
@@ -166,7 +327,7 @@ class DroneReactionLearner:
             vel2, _ = p.getBaseVelocity(d2, physicsClientId=client)
             pos2, vel2 = np.array(pos2), np.array(vel2)
 
-            state = np.concatenate([pos1 - pos2, vel2])
+            state = np.concatenate([pos1 - pos2, vel2, vel1])
             force = self._forward(flat, state)
             p.applyExternalForce(d2, -1, force.tolist(), pos2.tolist(),
                                  p.WORLD_FRAME, physicsClientId=client)
@@ -179,40 +340,17 @@ class DroneReactionLearner:
         p.disconnect(client)
         return self.fitness(distances)
 
-    # ── training (CEM) ────────────────────────────────────────────────────────
+    # ── training ──────────────────────────────────────────────────────────────
 
-    def train(self,
-              n_generations: int = 60,
-              pop_size: int = 24,
-              elite_frac: float = 0.25,
-              sigma: float = 0.5):
+    def train(self, optimizer: PolicyOptimizer | None = None):
         """
-        Cross-Entropy Method:
-          1. Sample pop_size candidates around the current mean (self.params)
-          2. Score each with _run_episode / fitness()
-          3. Keep the top elite_frac; update the mean to their centroid
-          4. Slowly shrink sigma so the search converges
+        Train the policy using the given optimizer.
+        Defaults to CEMOptimizer if none is provided.
         """
-        mu = self.params.copy()
-        n_elite = max(2, int(pop_size * elite_frac))
-
-        print(f"CEM  generations={n_generations}  pop={pop_size}  elite={n_elite}")
-        print(f"     params={self.n_params}  sigma0={sigma}")
-
-        for gen in range(n_generations):
-            candidates = mu + np.random.randn(pop_size, self.n_params) * sigma
-            scores = np.array([self._run_episode(c) for c in candidates])
-
-            elite_idx = np.argsort(scores)[-n_elite:]
-            mu = candidates[elite_idx].mean(axis=0)
-            sigma = max(0.02, sigma * 0.97)
-
-            print(f"  gen {gen + 1:3d}  "
-                  f"mean_dist={-scores.mean():.3f}  "
-                  f"best_dist={-scores[elite_idx[-1]]:.3f}  "
-                  f"sigma={sigma:.4f}")
-
-        self.params = mu
+        if optimizer is None:
+            optimizer = CEMOptimizer()
+        fitness_fn = lambda params: self._run_episode(params)
+        self.params = optimizer.optimize(fitness_fn, self.params)
         print("Training complete.")
 
     # ── persistence ───────────────────────────────────────────────────────────
@@ -228,21 +366,33 @@ class DroneReactionLearner:
 
 # ── CLI entry point ───────────────────────────────────────────────────────────
 
+OPTIMIZERS = {
+    "cem": CEMOptimizer,
+    "ga":  GAOptimizer,
+}
+
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "train"
     learner = DroneReactionLearner()
 
     if mode == "train":
-        learner.train()
+        algo = sys.argv[2] if len(sys.argv) > 2 else "cem"
+        if algo not in OPTIMIZERS:
+            print(f"Unknown optimizer '{algo}'. Choose from: {list(OPTIMIZERS)}")
+            sys.exit(1)
+        n_gen = int(sys.argv[3]) if len(sys.argv) > 3 else None
+        kwargs = {"n_generations": n_gen} if n_gen is not None else {}
+        learner.train(optimizer=OPTIMIZERS[algo](**kwargs))
         learner.save()
 
     elif mode == "eval":
         learner.load()
         episode = 0
         while True:
-            score = learner._run_episode(learner.params, n_steps=600, render=True, playback_speed=2.0)
+            score = learner._run_episode(
+                learner.params, n_steps=1000, render=True, playback_speed=2.0)
             episode += 1
             print(f"Episode {episode}  fitness={score:.4f}  mean_dist={-score:.3f}")
 
     else:
-        print("Usage: python drone_learner.py [train|eval]")
+        print("Usage: python drone_learner.py [train [cem|ga]] [eval]")
