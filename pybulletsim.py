@@ -59,10 +59,10 @@ def move(drone1, drone2, t):
     vel1 = np.array(vel1)
 
     leader_force = np.array([
-        np.sin(t * 1.0),
-        np.cos(t * 0.7),
-        np.sin(t * 0.5) * 0.3,
-    ]) * 5.0 - DAMPING * vel1
+        np.sin(t * 2.5) + 0.5 * np.sin(t * 4.1),
+        np.cos(t * 1.9) + 0.5 * np.cos(t * 3.3),
+        np.sin(t * 1.4) * 0.6,
+    ]) * 8.0 - DAMPING * vel1
 
     # Soft restoring force to keep drone1 within BOUNDS_RADIUS of origin
     dist_from_origin = np.linalg.norm(pos1)
